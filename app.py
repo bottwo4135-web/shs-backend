@@ -5,6 +5,7 @@ from flask import Flask, render_template, request, redirect, url_for, session, j
 from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.utils import secure_filename
 import requests
+from flask_cors import CORS  # <-- CORS import
 
 BASE_DIR = os.path.abspath(os.path.dirname(__file__))
 INSTANCE_DIR = os.path.join(BASE_DIR, 'instance')
@@ -14,7 +15,7 @@ ALLOWED_EXT = {'.png', '.jpg', '.jpeg', '.gif'}
 
 # Hugging Face configuration
 HF_API_TOKEN = os.environ.get('HF_API_TOKEN')
-HF_MODEL = os.environ.get('HF_MODEL', 'google/flan-t5-large')  # change as desired
+HF_MODEL = os.environ.get('HF_MODEL', 'google/flan-t5-large')
 HF_TIMEOUT = int(os.environ.get('HF_TIMEOUT', '15'))
 
 os.makedirs(INSTANCE_DIR, exist_ok=True)
@@ -23,6 +24,18 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 app = Flask(__name__, static_folder='static', template_folder='templates')
 app.secret_key = os.environ.get('SECRET_KEY', 'dev-secret-key-change-me')
 
+# ==================== CORS CONFIGURATION ====================
+CORS(
+    app,
+    resources={
+        r"/api/*": {
+            "origins": ["http://127.0.0.1:5500", "https://your-frontend-domain.com"],
+            "methods": ["GET", "POST", "OPTIONS"],
+            "allow_headers": ["Content-Type", "Authorization"]
+        }
+    }
+)
+# ===========================================================
 
 def call_hf_inference(prompt: str) -> str:
     """Call Hugging Face Inference API and return a text reply.
@@ -311,19 +324,14 @@ def api_send():
 
 @app.route('/api/ai', methods=['POST'])
 def api_ai():
-    # Use Hugging Face Inference API when configured; otherwise fallback to rule-based
     prompt = (request.form.get('message') or '').strip()
     if not prompt:
         return jsonify({'reply': 'Please enter a question about your health.'})
-
-    # try HF first
     hf_reply = ''
     if HF_API_TOKEN:
         hf_reply = call_hf_inference(prompt)
     if hf_reply:
         return jsonify({'reply': hf_reply})
-
-    # fallback rule-based responses
     lower = prompt.lower()
     if any(k in lower for k in ['emergency', 'bleeding', 'chest pain', 'stroke']):
         reply = 'This could be an emergency. Please call your local emergency number or go to the nearest emergency department immediately.'
