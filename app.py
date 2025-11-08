@@ -5,7 +5,7 @@ from flask import Flask, render_template, request, redirect, url_for, session, j
 from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.utils import secure_filename
 import requests
-from flask_cors import CORS  # <-- CORS import
+from flask_cors import CORS
 
 BASE_DIR = os.path.abspath(os.path.dirname(__file__))
 INSTANCE_DIR = os.path.join(BASE_DIR, 'instance')
@@ -27,20 +27,16 @@ app.secret_key = os.environ.get('SECRET_KEY', 'dev-secret-key-change-me')
 # ==================== CORS CONFIGURATION ====================
 CORS(
     app,
-    resources={
-        r"/api/*": {
-            "origins": ["http://127.0.0.1:5500", "https://your-frontend-domain.com"],
-            "methods": ["GET", "POST", "OPTIONS"],
-            "allow_headers": ["Content-Type", "Authorization"]
-        }
-    }
+    resources={r"/*": {"origins": [
+        "http://127.0.0.1:5500",
+        os.environ.get('FRONTEND_ORIGIN', 'https://your-frontend-domain.com')
+    ]}},
+    supports_credentials=True
 )
 # ===========================================================
 
 def call_hf_inference(prompt: str) -> str:
-    """Call Hugging Face Inference API and return a text reply.
-    Returns empty string on failure.
-    """
+    """Call Hugging Face Inference API and return a text reply. Returns empty string on failure."""
     if not HF_API_TOKEN:
         return ''
     url = f'https://api-inference.huggingface.co/models/{HF_MODEL}'
@@ -80,37 +76,37 @@ def init_db():
     cur = conn.cursor()
     cur.execute(
         '''CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            role TEXT NOT NULL CHECK(role IN ("doctor","patient")),
-            name TEXT NOT NULL,
-            email TEXT UNIQUE NOT NULL,
-            password_hash TEXT NOT NULL,
-            specialty TEXT,
-            availability INTEGER DEFAULT 0,
-            free_at TEXT,
-            avatar TEXT
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        role TEXT NOT NULL CHECK(role IN ("doctor","patient")),
+        name TEXT NOT NULL,
+        email TEXT UNIQUE NOT NULL,
+        password_hash TEXT NOT NULL,
+        specialty TEXT,
+        availability INTEGER DEFAULT 0,
+        free_at TEXT,
+        avatar TEXT
         )'''
     )
     cur.execute(
         '''CREATE TABLE IF NOT EXISTS chats (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            doctor_id INTEGER NOT NULL,
-            patient_id INTEGER NOT NULL,
-            created_at TEXT NOT NULL,
-            UNIQUE(doctor_id, patient_id),
-            FOREIGN KEY(doctor_id) REFERENCES users(id),
-            FOREIGN KEY(patient_id) REFERENCES users(id)
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        doctor_id INTEGER NOT NULL,
+        patient_id INTEGER NOT NULL,
+        created_at TEXT NOT NULL,
+        UNIQUE(doctor_id, patient_id),
+        FOREIGN KEY(doctor_id) REFERENCES users(id),
+        FOREIGN KEY(patient_id) REFERENCES users(id)
         )'''
     )
     cur.execute(
         '''CREATE TABLE IF NOT EXISTS messages (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            chat_id INTEGER NOT NULL,
-            sender_id INTEGER NOT NULL,
-            message TEXT NOT NULL,
-            created_at TEXT NOT NULL,
-            FOREIGN KEY(chat_id) REFERENCES chats(id),
-            FOREIGN KEY(sender_id) REFERENCES users(id)
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        chat_id INTEGER NOT NULL,
+        sender_id INTEGER NOT NULL,
+        message TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        FOREIGN KEY(chat_id) REFERENCES chats(id),
+        FOREIGN KEY(sender_id) REFERENCES users(id)
         )'''
     )
     conn.commit()
@@ -130,124 +126,108 @@ def current_user():
     conn.close()
     return user
 
-@app.route('/')
-def index():
-    return render_template('index.html')
-
-@app.route('/signup/<role>', methods=['GET', 'POST'])
+# ---------- Auth (session-based) ----------
+@app.route('/signup/<role>', methods=['POST'])
 def signup(role):
     if role not in ('doctor', 'patient'):
-        return redirect(url_for('index'))
-    if request.method == 'POST':
-        name = request.form.get('name','').strip()
-        email = request.form.get('email','').strip().lower()
-        password = request.form.get('password','')
-        specialty = request.form.get('specialty','').strip() if role == 'doctor' else None
-        file = request.files.get('avatar')
-        if not name or not email or not password:
-            flash('All fields are required')
-            return redirect(request.url)
-        avatar_path = None
-        if file and file.filename:
-            fname = secure_filename(file.filename)
-            ext = os.path.splitext(fname)[1].lower()
-            if ext not in ALLOWED_EXT:
-                flash('Invalid image type')
-                return redirect(request.url)
-            new_name = f"{datetime.utcnow().strftime('%Y%m%d%H%M%S%f')}{ext}"
-            dest = os.path.join(UPLOAD_DIR, new_name)
-            file.save(dest)
-            avatar_path = f"uploads/{new_name}"
-        pw_hash = generate_password_hash(password)
-        conn = get_db()
-        try:
-            conn.execute('INSERT INTO users(role, name, email, password_hash, specialty, avatar) VALUES (?, ?, ?, ?, ?, ?)',
-                         (role, name, email, pw_hash, specialty, avatar_path))
-            conn.commit()
-        except sqlite3.IntegrityError:
-            conn.close()
-            flash('Email already registered')
-            return redirect(request.url)
-        user = conn.execute('SELECT * FROM users WHERE email = ?', (email,)).fetchone()
+        return jsonify({'ok': False, 'error': 'invalid role'}), 400
+    name = request.form.get('name','').strip()
+    email = request.form.get('email','').strip().lower()
+    password = request.form.get('password','')
+    specialty = request.form.get('specialty','').strip() if role == 'doctor' else None
+    file = request.files.get('avatar')
+    if not name or not email or not password:
+        return jsonify({'ok': False, 'error': 'missing fields'}), 400
+    avatar_path = None
+    if file and file.filename:
+        fname = secure_filename(file.filename)
+        ext = os.path.splitext(fname)[1].lower()
+        if ext not in ALLOWED_EXT:
+            return jsonify({'ok': False, 'error': 'invalid image type'}), 400
+        new_name = f"{datetime.utcnow().strftime('%Y%m%d%H%M%S%f')}{ext}"
+        dest = os.path.join(UPLOAD_DIR, new_name)
+        file.save(dest)
+        avatar_path = f"uploads/{new_name}"
+    pw_hash = generate_password_hash(password)
+    conn = get_db()
+    try:
+        conn.execute('INSERT INTO users(role, name, email, password_hash, specialty, avatar) VALUES (?, ?, ?, ?, ?, ?)',
+            (role, name, email, pw_hash, specialty, avatar_path))
+        conn.commit()
+    except sqlite3.IntegrityError:
         conn.close()
-        session['user_id'] = user['id']
-        return redirect(url_for('doctor_dashboard' if role=='doctor' else 'patient_dashboard'))
-    return render_template('signup.html', role=role)
+        return jsonify({'ok': False, 'error': 'email exists'}), 409
+    user = conn.execute('SELECT * FROM users WHERE email = ?', (email,)).fetchone()
+    conn.close()
+    session['user_id'] = user['id']
+    return jsonify({'ok': True})
 
-@app.route('/login', methods=['GET', 'POST'])
+@app.route('/login', methods=['POST'])
 def login():
-    if request.method == 'POST':
-        email = request.form.get('email','').strip().lower()
-        password = request.form.get('password','')
-        conn = get_db()
-        user = conn.execute('SELECT * FROM users WHERE email = ?', (email,)).fetchone()
-        conn.close()
-        if user and check_password_hash(user['password_hash'], password):
-            session['user_id'] = user['id']
-            return redirect(url_for('doctor_dashboard' if user['role']=='doctor' else 'patient_dashboard'))
-        flash('Invalid credentials')
-        return redirect(request.url)
-    return render_template('login.html')
+    email = request.form.get('email','').strip().lower()
+    password = request.form.get('password','')
+    conn = get_db()
+    user = conn.execute('SELECT * FROM users WHERE email = ?', (email,)).fetchone()
+    conn.close()
+    if user and check_password_hash(user['password_hash'], password):
+        session['user_id'] = user['id']
+        return jsonify({'ok': True})
+    return jsonify({'ok': False, 'error': 'invalid credentials'}), 401
 
 @app.route('/logout')
 def logout():
     session.clear()
-    return redirect(url_for('index'))
-
-@app.route('/doctor')
-def doctor_dashboard():
-    user = current_user()
-    if not user or user['role'] != 'doctor':
-        return redirect(url_for('login'))
-    conn = get_db()
-    chats = conn.execute(
-        'SELECT c.id as chat_id, c.patient_id as patient_id, u.name as patient_name, u.avatar as patient_avatar, c.created_at '
-        'FROM chats c JOIN users u ON c.patient_id = u.id WHERE c.doctor_id = ? ORDER BY c.created_at DESC',
-        (user['id'],)
-    ).fetchall()
-    conn.close()
-    return render_template('doctor.html', user=user, chats=chats)
-
-@app.route('/patient')
-def patient_dashboard():
-    user = current_user()
-    if not user or user['role'] != 'patient':
-        return redirect(url_for('login'))
-    conn = get_db()
-    doctors = conn.execute('SELECT id, name, specialty, availability, free_at, avatar FROM users WHERE role = \"doctor\" ORDER BY availability DESC, name ASC').fetchall()
-    conn.close()
-    return render_template('patient.html', user=user, doctors=doctors)
-
-@app.route('/doctor/availability', methods=['POST'])
-def set_availability():
-    user = current_user()
-    if not user or user['role'] != 'doctor':
-        return jsonify({'ok': False, 'error': 'unauthorized'}), 401
-    available = 1 if request.form.get('available') == 'true' else 0
-    free_at = request.form.get('free_at')
-    conn = get_db()
-    conn.execute('UPDATE users SET availability = ?, free_at = ? WHERE id = ?', (available, free_at, user['id']))
-    conn.commit()
-    conn.close()
     return jsonify({'ok': True})
 
-@app.route('/chat/<int:other_id>')
-def chat_room(other_id):
+# ---------- JSON endpoints for frontend ----------
+@app.route('/api/me')
+def api_me():
     user = current_user()
     if not user:
-        return redirect(url_for('login'))
+        return jsonify({'error': 'unauthorized'}), 401
+    def avatar_url(a):
+        return url_for('uploaded_file', filename=os.path.basename(a)) if a else None
+    return jsonify({
+        'id': user['id'], 'role': user['role'], 'name': user['name'], 'email': user['email'],
+        'specialty': user['specialty'], 'availability': user['availability'], 'free_at': user['free_at'],
+        'avatar': avatar_url(user['avatar'])
+    })
+
+@app.route('/api/doctors')
+def api_doctors():
+    conn = get_db()
+    rows = conn.execute('SELECT id, name, specialty, availability, free_at, avatar FROM users WHERE role = "doctor" ORDER BY availability DESC, name ASC').fetchall()
+    conn.close()
+    def avatar_url(a):
+        return url_for('uploaded_file', filename=os.path.basename(a)) if a else None
+    return jsonify([{ 'id': r['id'], 'name': r['name'], 'specialty': r['specialty'], 'availability': r['availability'], 'free_at': r['free_at'], 'avatar': avatar_url(r['avatar']) } for r in rows])
+
+@app.route('/api/my_chats')
+def api_my_chats():
+    user = current_user()
+    if not user or user['role'] != 'doctor':
+        return jsonify([])
+    conn = get_db()
+    rows = conn.execute('SELECT c.id as chat_id, c.patient_id as patient_id, u.name as patient_name, u.avatar as patient_avatar, c.created_at FROM chats c JOIN users u ON c.patient_id = u.id WHERE c.doctor_id = ? ORDER BY c.created_at DESC', (user['id'],)).fetchall()
+    conn.close()
+    def avatar_url(a):
+        return url_for('uploaded_file', filename=os.path.basename(a)) if a else None
+    return jsonify([{ 'chat_id': r['chat_id'], 'patient_id': r['patient_id'], 'patient_name': r['patient_name'], 'patient_avatar': avatar_url(r['patient_avatar']), 'created_at': r['created_at'] } for r in rows])
+
+@app.route('/api/chat_init/<int:other_id>')
+def api_chat_init(other_id):
+    user = current_user()
+    if not user:
+        return jsonify({'error':'unauthorized'}), 401
     conn = get_db()
     other = conn.execute('SELECT * FROM users WHERE id = ?', (other_id,)).fetchone()
     if not other:
         conn.close()
-        return redirect(url_for('patient_dashboard' if user['role']=='patient' else 'doctor_dashboard'))
+        return jsonify({'error':'not found'}), 404
     if user['role'] == 'doctor' and other['role'] != 'patient':
-        conn.close()
-        return redirect(url_for('doctor_dashboard'))
+        conn.close(); return jsonify({'error':'invalid'}), 400
     if user['role'] == 'patient' and other['role'] != 'doctor':
-        conn.close()
-        return redirect(url_for('patient_dashboard'))
-    # ensure chat exists
+        conn.close(); return jsonify({'error':'invalid'}), 400
     if user['role'] == 'doctor':
         doctor_id, patient_id = user['id'], other_id
     else:
@@ -260,10 +240,17 @@ def chat_room(other_id):
         cur.execute('INSERT INTO chats(doctor_id, patient_id, created_at) VALUES (?, ?, ?)', (doctor_id, patient_id, created_at))
         conn.commit()
         chat = cur.execute('SELECT * FROM chats WHERE doctor_id = ? AND patient_id = ?', (doctor_id, patient_id)).fetchone()
-    # fetch last 50 messages
-    messages = conn.execute('SELECT m.*, u.name, u.avatar FROM messages m JOIN users u ON m.sender_id = u.id WHERE chat_id = ? ORDER BY m.created_at ASC', (chat['id'],)).fetchall()
+    def avatar_url(a):
+        return url_for('uploaded_file', filename=os.path.basename(a)) if a else None
+    payload = {
+        'chat_id': chat['id'],
+        'other': {
+            'id': other['id'], 'role': other['role'], 'name': other['name'],
+            'specialty': other['specialty'], 'avatar': avatar_url(other['avatar'])
+        }
+    }
     conn.close()
-    return render_template('chat.html', user=user, other=other, chat_id=chat['id'], messages=messages)
+    return jsonify(payload)
 
 @app.route('/api/messages/<int:chat_id>')
 def api_get_messages(chat_id):
@@ -280,12 +267,14 @@ def api_get_messages(chat_id):
     query += ' ORDER BY m.created_at ASC'
     rows = conn.execute(query, tuple(params)).fetchall()
     conn.close()
+    def avatar_url(a):
+        return url_for('uploaded_file', filename=os.path.basename(a)) if a else None
     return jsonify([
         {
             'id': r['id'],
             'sender_id': r['sender_id'],
             'name': r['name'],
-            'avatar': r['avatar'],
+            'avatar': avatar_url(r['avatar']),
             'message': r['message'],
             'created_at': r['created_at']
         } for r in rows
@@ -309,7 +298,13 @@ def api_send():
 
 @app.route('/api/ai', methods=['POST'])
 def api_ai():
-    prompt = (request.form.get('message') or '').strip()
+    # Support both JSON and form
+    prompt = ''
+    if request.is_json:
+        data = request.get_json(silent=True) or {}
+        prompt = (data.get('message') or '').strip()
+    else:
+        prompt = (request.form.get('message') or '').strip()
     if not prompt:
         return jsonify({'reply': 'Please enter a question about your health.'})
     hf_reply = ''
