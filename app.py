@@ -29,7 +29,7 @@ CORS(
     app,
     resources={r"/*": {"origins": [
         "http://127.0.0.1:5500",
-        os.environ.get('FRONTEND_ORIGIN', 'https://your-frontend-domain.com')
+        os.environ.get('FRONTEND_ORIGIN', 'https://bottwo4135-web.github')
     ]}},
     supports_credentials=True
 )
