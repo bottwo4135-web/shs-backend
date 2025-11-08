@@ -70,12 +70,10 @@ def call_hf_inference(prompt: str) -> str:
         return ''
     return ''
 
-
 def get_db():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
-
 
 def init_db():
     conn = get_db()
@@ -118,12 +116,10 @@ def init_db():
     conn.commit()
     conn.close()
 
-
 @app.before_request
 def ensure_db():
     if not os.path.exists(DB_PATH):
         init_db()
-
 
 def current_user():
     uid = session.get('user_id')
@@ -134,11 +130,9 @@ def current_user():
     conn.close()
     return user
 
-
 @app.route('/')
 def index():
     return render_template('index.html')
-
 
 @app.route('/signup/<role>', methods=['GET', 'POST'])
 def signup(role):
@@ -180,7 +174,6 @@ def signup(role):
         return redirect(url_for('doctor_dashboard' if role=='doctor' else 'patient_dashboard'))
     return render_template('signup.html', role=role)
 
-
 @app.route('/login', methods=['GET', 'POST'])
 def login():
     if request.method == 'POST':
@@ -196,12 +189,10 @@ def login():
         return redirect(request.url)
     return render_template('login.html')
 
-
 @app.route('/logout')
 def logout():
     session.clear()
     return redirect(url_for('index'))
-
 
 @app.route('/doctor')
 def doctor_dashboard():
@@ -217,17 +208,15 @@ def doctor_dashboard():
     conn.close()
     return render_template('doctor.html', user=user, chats=chats)
 
-
 @app.route('/patient')
 def patient_dashboard():
     user = current_user()
     if not user or user['role'] != 'patient':
         return redirect(url_for('login'))
     conn = get_db()
-    doctors = conn.execute('SELECT id, name, specialty, availability, free_at, avatar FROM users WHERE role = "doctor" ORDER BY availability DESC, name ASC').fetchall()
+    doctors = conn.execute('SELECT id, name, specialty, availability, free_at, avatar FROM users WHERE role = \"doctor\" ORDER BY availability DESC, name ASC').fetchall()
     conn.close()
     return render_template('patient.html', user=user, doctors=doctors)
-
 
 @app.route('/doctor/availability', methods=['POST'])
 def set_availability():
@@ -241,7 +230,6 @@ def set_availability():
     conn.commit()
     conn.close()
     return jsonify({'ok': True})
-
 
 @app.route('/chat/<int:other_id>')
 def chat_room(other_id):
@@ -277,7 +265,6 @@ def chat_room(other_id):
     conn.close()
     return render_template('chat.html', user=user, other=other, chat_id=chat['id'], messages=messages)
 
-
 @app.route('/api/messages/<int:chat_id>')
 def api_get_messages(chat_id):
     user = current_user()
@@ -304,7 +291,6 @@ def api_get_messages(chat_id):
         } for r in rows
     ])
 
-
 @app.route('/api/send', methods=['POST'])
 def api_send():
     user = current_user()
@@ -320,7 +306,6 @@ def api_send():
     conn.commit()
     conn.close()
     return jsonify({'ok': True, 'created_at': created_at})
-
 
 @app.route('/api/ai', methods=['POST'])
 def api_ai():
@@ -343,11 +328,9 @@ def api_ai():
         reply = 'I am a virtual assistant and cannot provide a diagnosis. For specific concerns, please consult a licensed physician.'
     return jsonify({'reply': reply})
 
-
 @app.route('/static/uploads/<path:filename>')
 def uploaded_file(filename):
     return send_from_directory(UPLOAD_DIR, filename)
-
 
 if __name__ == '__main__':
     init_db()
