@@ -1,7 +1,8 @@
 import os
 import sqlite3
-from datetime import datetime
-from flask import Flask, render_template, request, redirect, url_for, session, jsonify, send_from_directory, flash
+import secrets
+from datetime import datetime, timedelta
+from flask import Flask, request, jsonify, send_from_directory, url_for
 from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.utils import secure_filename
 import requests
@@ -24,31 +25,20 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 app = Flask(__name__, static_folder='static', template_folder='templates')
 app.secret_key = os.environ.get('SECRET_KEY', 'dev-secret-key-change-me')
 
-# ==================== CORS CONFIGURATION ====================
-CORS(
-    app,
-    resources={r"/*": {"origins": [
-        "http://127.0.0.1:5500",
-        os.environ.get('FRONTEND_ORIGIN', 'https://bottwo4135-web.github')
-    ]}},
-    supports_credentials=True
-)
-# ===========================================================
+# CORS for token-based auth (no credentials needed)
+FRONTEND = os.environ.get('FRONTEND_ORIGIN', 'https://bottwo4135-web.github')
+CORS(app, resources={r"/*": {"origins": [
+    "http://127.0.0.1:5500",
+    FRONTEND
+]}})
+
 
 def call_hf_inference(prompt: str) -> str:
-    """Call Hugging Face Inference API and return a text reply. Returns empty string on failure."""
     if not HF_API_TOKEN:
         return ''
     url = f'https://api-inference.huggingface.co/models/{HF_MODEL}'
-    headers = {
-        'Authorization': f'Bearer {HF_API_TOKEN}',
-        'Accept': 'application/json'
-    }
-    payload = {
-        'inputs': prompt,
-        'options': {'wait_for_model': True},
-        'parameters': {'max_new_tokens': 256, 'temperature': 0.2}
-    }
+    headers = {'Authorization': f'Bearer {HF_API_TOKEN}', 'Accept': 'application/json'}
+    payload = {'inputs': prompt, 'options': {'wait_for_model': True}, 'parameters': {'max_new_tokens': 256, 'temperature': 0.2}}
     try:
         resp = requests.post(url, headers=headers, json=payload, timeout=HF_TIMEOUT)
         if resp.status_code != 200:
@@ -66,10 +56,12 @@ def call_hf_inference(prompt: str) -> str:
         return ''
     return ''
 
+
 def get_db():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
+
 
 def init_db():
     conn = get_db()
@@ -109,24 +101,55 @@ def init_db():
         FOREIGN KEY(sender_id) REFERENCES users(id)
         )'''
     )
+    cur.execute(
+        '''CREATE TABLE IF NOT EXISTS tokens (
+        token TEXT PRIMARY KEY,
+        user_id INTEGER NOT NULL,
+        expires_at TEXT NOT NULL,
+        FOREIGN KEY(user_id) REFERENCES users(id)
+        )'''
+    )
     conn.commit()
     conn.close()
+
 
 @app.before_request
 def ensure_db():
     if not os.path.exists(DB_PATH):
         init_db()
 
-def current_user():
-    uid = session.get('user_id')
-    if not uid:
+
+def issue_token(user_id: int) -> str:
+    token = secrets.token_urlsafe(32)
+    expires_at = (datetime.utcnow() + timedelta(days=7)).isoformat()
+    conn = get_db()
+    conn.execute('INSERT INTO tokens(token, user_id, expires_at) VALUES (?, ?, ?)', (token, user_id, expires_at))
+    conn.commit(); conn.close()
+    return token
+
+
+def current_user_token():
+    auth = request.headers.get('Authorization', '')
+    if not auth.startswith('Bearer '):
+        return None
+    token = auth.split(' ', 1)[1].strip()
+    if not token:
         return None
     conn = get_db()
-    user = conn.execute('SELECT * FROM users WHERE id = ?', (uid,)).fetchone()
+    row = conn.execute('SELECT t.user_id, t.expires_at, u.* FROM tokens t JOIN users u ON u.id = t.user_id WHERE t.token = ?', (token,)).fetchone()
+    if not row:
+        conn.close(); return None
+    try:
+        if datetime.fromisoformat(row['expires_at']) < datetime.utcnow():
+            conn.execute('DELETE FROM tokens WHERE token = ?', (token,))
+            conn.commit(); conn.close(); return None
+    except Exception:
+        pass
     conn.close()
-    return user
+    return row
 
-# ---------- Auth (session-based) ----------
+
+# ---------- Auth (token-based) ----------
 @app.route('/signup/<role>', methods=['POST'])
 def signup(role):
     if role not in ('doctor', 'patient'):
@@ -155,12 +178,12 @@ def signup(role):
             (role, name, email, pw_hash, specialty, avatar_path))
         conn.commit()
     except sqlite3.IntegrityError:
-        conn.close()
-        return jsonify({'ok': False, 'error': 'email exists'}), 409
+        conn.close(); return jsonify({'ok': False, 'error': 'email exists'}), 409
     user = conn.execute('SELECT * FROM users WHERE email = ?', (email,)).fetchone()
     conn.close()
-    session['user_id'] = user['id']
-    return jsonify({'ok': True})
+    token = issue_token(user['id'])
+    return jsonify({'ok': True, 'token': token})
+
 
 @app.route('/login', methods=['POST'])
 def login():
@@ -170,19 +193,24 @@ def login():
     user = conn.execute('SELECT * FROM users WHERE email = ?', (email,)).fetchone()
     conn.close()
     if user and check_password_hash(user['password_hash'], password):
-        session['user_id'] = user['id']
-        return jsonify({'ok': True})
+        token = issue_token(user['id'])
+        return jsonify({'ok': True, 'token': token})
     return jsonify({'ok': False, 'error': 'invalid credentials'}), 401
 
-@app.route('/logout')
+
+@app.route('/logout', methods=['POST'])
 def logout():
-    session.clear()
+    auth = request.headers.get('Authorization', '')
+    if auth.startswith('Bearer '):
+        token = auth.split(' ',1)[1]
+        conn = get_db(); conn.execute('DELETE FROM tokens WHERE token = ?', (token,)); conn.commit(); conn.close()
     return jsonify({'ok': True})
+
 
 # ---------- JSON endpoints for frontend ----------
 @app.route('/api/me')
 def api_me():
-    user = current_user()
+    user = current_user_token()
     if not user:
         return jsonify({'error': 'unauthorized'}), 401
     def avatar_url(a):
@@ -193,6 +221,19 @@ def api_me():
         'avatar': avatar_url(user['avatar'])
     })
 
+
+@app.route('/doctor/availability', methods=['POST'])
+def set_availability():
+    user = current_user_token()
+    if not user or user['role'] != 'doctor':
+        return jsonify({'ok': False, 'error': 'unauthorized'}), 401
+    available = 1 if request.form.get('available') == 'true' else 0
+    free_at = request.form.get('free_at')
+    conn = get_db(); conn.execute('UPDATE users SET availability = ?, free_at = ? WHERE id = ?', (available, free_at, user['id']))
+    conn.commit(); conn.close()
+    return jsonify({'ok': True})
+
+
 @app.route('/api/doctors')
 def api_doctors():
     conn = get_db()
@@ -202,9 +243,10 @@ def api_doctors():
         return url_for('uploaded_file', filename=os.path.basename(a)) if a else None
     return jsonify([{ 'id': r['id'], 'name': r['name'], 'specialty': r['specialty'], 'availability': r['availability'], 'free_at': r['free_at'], 'avatar': avatar_url(r['avatar']) } for r in rows])
 
+
 @app.route('/api/my_chats')
 def api_my_chats():
-    user = current_user()
+    user = current_user_token()
     if not user or user['role'] != 'doctor':
         return jsonify([])
     conn = get_db()
@@ -214,16 +256,16 @@ def api_my_chats():
         return url_for('uploaded_file', filename=os.path.basename(a)) if a else None
     return jsonify([{ 'chat_id': r['chat_id'], 'patient_id': r['patient_id'], 'patient_name': r['patient_name'], 'patient_avatar': avatar_url(r['patient_avatar']), 'created_at': r['created_at'] } for r in rows])
 
+
 @app.route('/api/chat_init/<int:other_id>')
 def api_chat_init(other_id):
-    user = current_user()
+    user = current_user_token()
     if not user:
         return jsonify({'error':'unauthorized'}), 401
     conn = get_db()
     other = conn.execute('SELECT * FROM users WHERE id = ?', (other_id,)).fetchone()
     if not other:
-        conn.close()
-        return jsonify({'error':'not found'}), 404
+        conn.close(); return jsonify({'error':'not found'}), 404
     if user['role'] == 'doctor' and other['role'] != 'patient':
         conn.close(); return jsonify({'error':'invalid'}), 400
     if user['role'] == 'patient' and other['role'] != 'doctor':
@@ -249,40 +291,32 @@ def api_chat_init(other_id):
             'specialty': other['specialty'], 'avatar': avatar_url(other['avatar'])
         }
     }
-    conn.close()
-    return jsonify(payload)
+    conn.close(); return jsonify(payload)
+
 
 @app.route('/api/messages/<int:chat_id>')
 def api_get_messages(chat_id):
-    user = current_user()
-    if not user:
-        return jsonify([])
+    user = current_user_token()
+    if not user: return jsonify([])
     after = request.args.get('after')
     conn = get_db()
     params = [chat_id]
     query = 'SELECT m.*, u.name, u.avatar FROM messages m JOIN users u ON m.sender_id = u.id WHERE chat_id = ?'
     if after:
-        query += ' AND m.created_at > ?'
-        params.append(after)
+        query += ' AND m.created_at > ?'; params.append(after)
     query += ' ORDER BY m.created_at ASC'
-    rows = conn.execute(query, tuple(params)).fetchall()
-    conn.close()
+    rows = conn.execute(query, tuple(params)).fetchall(); conn.close()
     def avatar_url(a):
         return url_for('uploaded_file', filename=os.path.basename(a)) if a else None
     return jsonify([
-        {
-            'id': r['id'],
-            'sender_id': r['sender_id'],
-            'name': r['name'],
-            'avatar': avatar_url(r['avatar']),
-            'message': r['message'],
-            'created_at': r['created_at']
-        } for r in rows
+        { 'id': r['id'], 'sender_id': r['sender_id'], 'name': r['name'], 'avatar': avatar_url(r['avatar']), 'message': r['message'], 'created_at': r['created_at'] }
+        for r in rows
     ])
+
 
 @app.route('/api/send', methods=['POST'])
 def api_send():
-    user = current_user()
+    user = current_user_token()
     if not user:
         return jsonify({'ok': False, 'error': 'unauthorized'}), 401
     chat_id = request.form.get('chat_id')
@@ -290,19 +324,17 @@ def api_send():
     if not chat_id or not text:
         return jsonify({'ok': False, 'error': 'invalid'}), 400
     created_at = datetime.utcnow().isoformat()
-    conn = get_db()
-    conn.execute('INSERT INTO messages(chat_id, sender_id, message, created_at) VALUES (?, ?, ?, ?)', (chat_id, user['id'], text, created_at))
-    conn.commit()
-    conn.close()
+    conn = get_db(); conn.execute('INSERT INTO messages(chat_id, sender_id, message, created_at) VALUES (?, ?, ?, ?)', (chat_id, user['id'], text, created_at))
+    conn.commit(); conn.close()
     return jsonify({'ok': True, 'created_at': created_at})
+
 
 @app.route('/api/ai', methods=['POST'])
 def api_ai():
     # Support both JSON and form
     prompt = ''
     if request.is_json:
-        data = request.get_json(silent=True) or {}
-        prompt = (data.get('message') or '').strip()
+        data = request.get_json(silent=True) or {}; prompt = (data.get('message') or '').strip()
     else:
         prompt = (request.form.get('message') or '').strip()
     if not prompt:
@@ -323,9 +355,11 @@ def api_ai():
         reply = 'I am a virtual assistant and cannot provide a diagnosis. For specific concerns, please consult a licensed physician.'
     return jsonify({'reply': reply})
 
+
 @app.route('/static/uploads/<path:filename>')
 def uploaded_file(filename):
     return send_from_directory(UPLOAD_DIR, filename)
+
 
 if __name__ == '__main__':
     init_db()
